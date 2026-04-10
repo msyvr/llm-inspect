@@ -55,3 +55,6 @@ This hooks into the transformer layer and collects the layer-specific activation
 - Hook registered on `model.transformer.h[layer_idx]`
 - Extracts hidden states: `(batch_size, sequence_length, 768)`
 - Averages over sequence: `(batch_size, 768)`
+
+**Result**:
+![activations](results/analysis_uncertainty_gpt2.png)
