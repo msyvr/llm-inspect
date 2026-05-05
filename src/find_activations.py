@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from nnsight import LanguageModel
 from tqdm import tqdm
 
 if torch.backends.mps.is_available():
@@ -60,120 +60,99 @@ LOW_UNCERTAINTY_PROMPTS = [
 ]
 
 # ============================================================================
-# ACTIVATION EXTRACTION
+# ACTIVATION EXTRACTION (NNsight)
+# ============================================================================
+#
+# Replaces the manual forward-hook approach with NNsight tracing.
+# - No hook registration / removal lifecycle.
+# - Activations are accessed declaratively inside a `with model.trace(...)`
+#   context; `.save()` retains the value after the context exits.
+# - Tokenization is handled internally by NNsight using model.tokenizer.
 # ============================================================================
 
-class ActivationExtractor:
-    """Extract activations from specific layer during forward pass."""
-    
-    def __init__(self, model, layer_idx: int):
-        self.model = model
-        self.layer_idx = layer_idx
-        self.activations = None
-        self.hook_handle = None
-        
-    def hook_fn(self, module, input, output):
-        """Hook function to capture activations."""
-        # output is a tuple, first element is the hidden states
-        hidden_states = output[0]  # Shape: (batch, seq_len, hidden_dim)
-        # Mean over sequence length gives per-sample activation
-        self.activations = hidden_states.mean(dim=1).detach().cpu()  # (batch, hidden_dim)
-        
-    def register_hook(self):
-        """Register the hook on target layer."""
-        target_layer = self.model.transformer.h[self.layer_idx]
-        self.hook_handle = target_layer.register_forward_hook(self.hook_fn)
-        
-    def remove_hook(self):
-        """Remove the hook."""
-        if self.hook_handle:
-            self.hook_handle.remove()
-            
-    def get_activations(self, prompt: str, tokenizer) -> np.ndarray:
-        """Get activations for a prompt."""
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=MAX_LENGTH, 
-                          truncation=True, padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Forward pass (hook captures activations)
-        with torch.no_grad():
-            _ = self.model(**inputs)
-            
-        return self.activations.numpy()[0]
+def get_layer_activation(model: LanguageModel, prompt: str,
+                         layer_idx: int) -> np.ndarray:
+    """Extract mean-pooled hidden states from a single transformer block.
+
+    Returns a numpy array of shape (hidden_dim,) — the per-prompt activation,
+    mean-pooled across the sequence dimension.
+    """
+    with model.trace(prompt):
+        # GPT-2 block output is a tuple; [0] is the hidden state tensor
+        # of shape (batch, seq_len, hidden_dim). Mean across seq_len.
+        activation = model.transformer.h[layer_idx].output[0].mean(dim=1).save()
+
+    # In current NNsight, the saved object behaves as a tensor directly
+    # (older versions required `.value` to unwrap a proxy).
+    # Shape: (batch=1, hidden_dim) -> squeeze to (hidden_dim,)
+    return activation.squeeze(0).detach().cpu().numpy()
 
 # ============================================================================
 # DATA GENERATION/COLLECTION
 # ============================================================================
 
-def load_model_and_tokenizer(model_name: str = MODEL_NAME):
-    """Load model and tokenizer."""
-    if model_name.startswith("gpt"):
-        print("\nLoading GPT-2 Small (124M parameters)...")
-        tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        model = GPT2LMHeadModel.from_pretrained(model_name)
-    else:
-        print("Model name not recognized")
-    model.to(device)
-    model.eval()
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
+def load_model(model_name: str = MODEL_NAME) -> LanguageModel:
+    """Load model via NNsight."""
+    print(f"\nLoading {model_name} (NNsight wrapper around HF transformers)...")
+
+    # dispatch=True forces immediate model load (default is lazy);
+    # device_map places weights on the chosen device.
+    model = LanguageModel(model_name, device_map=str(device), dispatch=True)
+
+    # NNsight exposes the underlying tokenizer as model.tokenizer
+    if model.tokenizer.pad_token is None:
+        model.tokenizer.pad_token = model.tokenizer.eos_token
+
     print(f"Model loaded on {device}")
     print(f"  - Parameters: 124M")
     print(f"  - Layers: 12")
     print(f"  - Hidden dim: 768")
     print(f"  - Target layer: {TARGET_LAYER}")
-    
-    return model, tokenizer
 
-def collect_experimental_data(model, tokenizer) -> Tuple[np.ndarray, np.ndarray, list[dict]]:
+    return model
+
+def collect_experimental_data(model: LanguageModel) -> Tuple[np.ndarray, np.ndarray, list[dict]]:
     """
     Collect REAL activation data for high and low uncertainty prompts.
-    
+
     Returns:
         high_uncertainty_activations: (n_samples, n_neurons)
         low_uncertainty_activations: (n_samples, n_neurons)
         all_results: list of result dictionaries
     """
-    extractor = ActivationExtractor(model, TARGET_LAYER)
-    extractor.register_hook()
-    
     print("\n[1/2] Collecting HIGH uncertainty activations...")
     high_results = []
     for prompt in tqdm(HIGH_UNCERTAINTY_PROMPTS):
-        activations = extractor.get_activations(prompt, tokenizer)
+        activations = get_layer_activation(model, prompt, TARGET_LAYER)
         high_results.append({
             'prompt': prompt,
             'activations': activations
         })
-    
+
     print("\n[2/2] Collecting LOW uncertainty activations...")
     low_results = []
     for prompt in tqdm(LOW_UNCERTAINTY_PROMPTS):
-        activations = extractor.get_activations(prompt, tokenizer)
+        activations = get_layer_activation(model, prompt, TARGET_LAYER)
         low_results.append({
             'prompt': prompt,
             'activations': activations
         })
-    
-    extractor.remove_hook()
-    
+
     high_activations = np.array([r['activations'] for r in high_results])
     low_activations = np.array([r['activations'] for r in low_results])
-    
+
     print(f"\nCollected activations:")
     print(f"  - Shape: {high_activations.shape}")
     print(f"  - High uncertainty samples: {len(high_results)}")
     print(f"  - Low uncertainty samples: {len(low_results)}")
-    
+
     return high_activations, low_activations, high_results + low_results
 
 # ============================================================================
 # ANALYSIS
 # ============================================================================
 
-def identify_uncertainty_neurons(high_act: np.ndarray, low_act: np.ndarray, 
+def identify_uncertainty_neurons(high_act: np.ndarray, low_act: np.ndarray,
                                 top_k: int = 20) -> np.ndarray:
     """Identify neurons most strongly associated with uncertainty."""
     high_mean = np.mean(high_act, axis=0)
@@ -196,24 +175,24 @@ def compute_effect_sizes(high_act: np.ndarray, low_act: np.ndarray) -> np.ndarra
 # VISUALIZATION
 # ============================================================================
 
-def plot_results(high_act: np.ndarray, low_act: np.ndarray, 
+def plot_results(high_act: np.ndarray, low_act: np.ndarray,
                 top_neurons: np.ndarray, all_results: list[dict]):
     """Create clean diagnostic plots."""
-    
+
     num_neurons = high_act.shape[1]
     color_high = '#2ecc71'
     color_low = '#3498db'
     color_accent = '#e74c3c'
-    
+
     fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-    fig.suptitle(f'LLM inspect for {TARGET_STATE}: activations from {MODEL_NAME}', 
+    fig.suptitle(f'LLM inspect for {TARGET_STATE}: activations from {MODEL_NAME}',
                  fontsize=14, fontweight='bold', y=0.98)
-    
+
     # Plot 1: Neuron selectivity
     ax = axes[0, 0]
     diff = np.mean(high_act, axis=0) - np.mean(low_act, axis=0)
     ax.bar(range(len(diff)), diff, alpha=0.3, color='gray', width=1.0, linewidth=0)
-    ax.bar(top_neurons[:20], diff[top_neurons[:20]], 
+    ax.bar(top_neurons[:20], diff[top_neurons[:20]],
            color=color_accent, alpha=0.8, width=1.0, linewidth=0)
     ax.set_xlabel('Neuron index')
     ax.set_ylabel('Activation delta (high - low)')
@@ -222,7 +201,7 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.spines['right'].set_visible(False)
     ax.axhline(y=0, color='black', linewidth=0.8, linestyle='-', alpha=0.3)
     ax.set_xlim(-10, num_neurons + 10)
-    
+
     # Plot 2: Top 10 neurons
     ax = axes[0, 1]
     top_10 = top_neurons[:10]
@@ -230,9 +209,9 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     width = 0.35
     high_vals = np.mean(high_act[:, top_10], axis=0)
     low_vals = np.mean(low_act[:, top_10], axis=0)
-    ax.bar(x - width/2, high_vals, width, label=f'High {TARGET_STATE}', 
+    ax.bar(x - width/2, high_vals, width, label=f'High {TARGET_STATE}',
            color=color_high, alpha=0.8, linewidth=0)
-    ax.bar(x + width/2, low_vals, width, label=f'Low {TARGET_STATE}', 
+    ax.bar(x + width/2, low_vals, width, label=f'Low {TARGET_STATE}',
            color=color_low, alpha=0.8, linewidth=0)
     ax.set_xlabel('Top neurons')
     ax.set_ylabel('Mean activation')
@@ -242,11 +221,11 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.legend(frameon=False)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    
+
     # Plot 3: Effect sizes
     ax = axes[0, 2]
     effect_sizes = compute_effect_sizes(high_act, low_act)
-    counts, bins, patches = ax.hist(effect_sizes, bins=40, alpha=0.7, 
+    counts, bins, patches = ax.hist(effect_sizes, bins=40, alpha=0.7,
                                     color='gray', edgecolor='none')
     for i, patch in enumerate(patches):
         if bins[i] > 0.8 or bins[i] < -0.8:
@@ -261,12 +240,12 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.legend(frameon=False, fontsize=8)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    
+
     # Plot 4: Best neuron distribution
     ax = axes[1, 0]
     best_neuron = top_neurons[0]
     parts = ax.violinplot([high_act[:, best_neuron], low_act[:, best_neuron]],
-                          positions=[0, 1], widths=0.6, showmeans=True, 
+                          positions=[0, 1], widths=0.6, showmeans=True,
                           showextrema=True)
     parts['bodies'][0].set_facecolor(color_high)
     parts['bodies'][0].set_alpha(0.7)
@@ -281,7 +260,7 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.set_title(f'Best neuron (N{best_neuron})', fontweight='bold')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    
+
     # Plot 5: Activation heatmap
     ax = axes[1, 1]
     # Find interesting window around top neurons
@@ -289,14 +268,14 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     window_start = max(0, top_neuron_idx - 30)
     window_end = min(num_neurons, top_neuron_idx + 30)
     window = slice(window_start, window_end)
-    
+
     all_act = np.vstack([high_act[:, window], low_act[:, window]])
-    im = ax.imshow(all_act, aspect='auto', cmap='viridis', 
+    im = ax.imshow(all_act, aspect='auto', cmap='viridis',
                    interpolation='nearest')
     ax.set_xlabel('Neuron index')
     ax.set_ylabel('Sample')
     ax.set_title(f'Activation pattern (N{window_start}-{window_end})', fontweight='bold')
-    
+
     n_ticks = 5
     tick_positions = np.linspace(0, window_end - window_start - 1, n_ticks)
     tick_labels = np.linspace(window_start, window_end - 1, n_ticks).astype(int)
@@ -305,7 +284,7 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.axhline(y=len(high_act) - 0.5, color='white', linewidth=2, linestyle='--')
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label('Activation', rotation=270, labelpad=15)
-    
+
     # Plot 6: Correlation
     ax = axes[1, 2]
     top_5 = top_neurons[:5]
@@ -322,31 +301,31 @@ def plot_results(high_act: np.ndarray, low_act: np.ndarray,
     ax.set_title('Top 5 Neuron correlation', fontweight='bold')
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label('Correlation', rotation=270, labelpad=15)
-    
+
     plt.tight_layout()
-    plt.savefig(f'results/analysis_{TARGET_STATE}_{MODEL_NAME}.png', 
+    plt.savefig(f'results/analysis_{TARGET_STATE}_{MODEL_NAME}.png',
                 dpi=150, bbox_inches='tight', facecolor='white')
     print("\n✓ Saved: uncertainty_analysis_gpt2.png")
-    
+
     return fig
 
 # ============================================================================
 # SUMMARY STATISTICS
 # ============================================================================
 
-def print_summary(high_act: np.ndarray, low_act: np.ndarray, 
+def print_summary(high_act: np.ndarray, low_act: np.ndarray,
                  top_neurons: np.ndarray, all_results: list[dict]):
     """Print summary statistics."""
     print("\n" + "="*70)
     print("EXPERIMENTAL SUMMARY")
     print("="*70)
-    
+
     print(f"\nData collected:")
     print(f"  - High uncertainty samples: {len(high_act)}")
     print(f"  - Low uncertainty samples: {len(low_act)}")
     print(f"  - Total neurons analyzed: {high_act.shape[1]}")
     print(f"  - Layer: {TARGET_LAYER}")
-    
+
     print(f"\nTop 5 uncertainty neurons (by activation difference):")
     for i, neuron_idx in enumerate(top_neurons[:5], 1):
         high_mean = np.mean(high_act[:, neuron_idx])
@@ -355,7 +334,7 @@ def print_summary(high_act: np.ndarray, low_act: np.ndarray,
         print(f"  {i}. Neuron {neuron_idx}: "
               f"High={high_mean:.3f}, Low={low_mean:.3f}, "
               f"Δ={high_mean-low_mean:.3f}, d={effect_size:.2f}")
-    
+
     print(f"\nExample prompts:")
     print(f"  HIGH: {all_results[0]['prompt']}")
     print(f"  LOW:  {all_results[-1]['prompt']}")
@@ -365,41 +344,41 @@ def print_summary(high_act: np.ndarray, low_act: np.ndarray,
 # TECHNICAL ISSUES
 # ============================================================================
 
-def analyze_technical_issues(high_act: np.ndarray, low_act: np.ndarray, 
+def analyze_technical_issues(high_act: np.ndarray, low_act: np.ndarray,
                             top_neurons: np.ndarray):
     """Identify potential technical issues."""
     print("\n" + "="*70)
     print("TECHNICAL ISSUES")
     print("="*70)
-    
+
     issues = []
-    
+
     # Sample size
     if len(high_act) < 30:
         issues.append(f"Small sample size: {len(high_act)} per condition (need 30+)")
-    
+
     # Effect sizes
     effect_sizes = compute_effect_sizes(high_act, low_act)
     weak_effects = np.mean(np.abs(effect_sizes) < 0.2)
     if weak_effects > 0.9:
         issues.append(f"Weak effects: {weak_effects*100:.0f}% neurons show d < 0.2")
-    
+
     # Correlation
     top_5 = top_neurons[:5]
     corr_matrix = np.corrcoef(high_act[:, top_5].T)
     high_corr = np.mean(np.abs(corr_matrix[np.triu_indices_from(corr_matrix, k=1)])) > 0.8
     if high_corr:
         issues.append("High correlation among top neurons (may be redundant)")
-    
+
     issues.append("Need validation: ablation studies to test causality")
     issues.append("Single layer only: check other layers for distributed patterns")
-    
+
     if issues:
         for issue in issues:
             print(f"\n{issue}")
     else:
         print("\nNo major issues detected")
-    
+
     print("\n" + "="*70)
 
 # ============================================================================
@@ -409,34 +388,34 @@ def analyze_technical_issues(high_act: np.ndarray, low_act: np.ndarray,
 def main():
     """Run the complete experiment."""
     print("="*70)
-    print("MECHANISTIC INTERPRETABILITY: REAL ACTIVATIONS")
+    print("MECHANISTIC INTERPRETABILITY: REAL ACTIVATIONS (NNsight)")
     print("Model: GPT-2 Small (124M parameters)")
     print("Target: Uncertainty Detection")
     print("="*70)
 
     # Load model
-    model, tokenizer = load_model_and_tokenizer(MODEL_NAME)
-    
+    model = load_model(MODEL_NAME)
+
     # Collect data
     print("\n[1/5] Collecting activation data...")
-    high_act, low_act, all_results = collect_experimental_data(model, tokenizer)
-    
+    high_act, low_act, all_results = collect_experimental_data(model)
+
     # Identify neurons
     print("\n[2/5] Identifying uncertainty neurons...")
     top_neurons = identify_uncertainty_neurons(high_act, low_act, top_k=20)
-    
+
     # Visualize
     print("\n[3/5] Generating visualizations...")
     plot_results(high_act, low_act, top_neurons, all_results)
-    
+
     # Summary
     print("\n[4/5] Computing summary statistics...")
     print_summary(high_act, low_act, top_neurons, all_results)
-    
+
     # Issues
     print("\n[5/5] Analyzing technical issues...")
     analyze_technical_issues(high_act, low_act, top_neurons)
-    
+
     print("\n✓ Experiment complete!")
     print("\nNext steps:")
     print("  1. Try different layers (0-11)")
